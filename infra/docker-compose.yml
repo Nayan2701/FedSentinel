@@ -1,0 +1,90 @@
+
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: fedsentinel-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js", "-m", "8222"]
+    networks: [fedsentinel_net]
+
+  minio:
+    image: minio/minio:latest
+    container_name: fedsentinel-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - fedsentinel_minio_data:/data
+    networks: [fedsentinel_net]
+
+  minio-mc:
+    image: minio/mc:latest
+    container_name: fedsentinel-minio-mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      chmod +x /scripts/init_minio.sh &&
+      /scripts/init_minio.sh &&
+      tail -f /dev/null
+      "
+    volumes:
+      - ../scripts:/scripts
+    networks: [fedsentinel_net]
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: fedsentinel-nessie
+    ports:
+      - "19120:19120"
+    environment:
+      QUARKUS_HTTP_PORT: 19120
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+    networks: [fedsentinel_net]
+
+  spark-iceberg:
+    image: tabulario/spark-iceberg:latest
+    container_name: fedsentinel-spark-iceberg
+    depends_on:
+      - minio
+      - nessie
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    volumes:
+      - ../scripts:/opt/spark/scripts
+    networks: [fedsentinel_net]
+    command: >
+      /bin/bash -c "
+      spark-sql
+      --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.94.0,software.amazon.awssdk:bundle:2.20.160,software.amazon.awssdk:url-connection-client:2.20.160
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.projectnessie.spark.extensions.NessieSparkSessionExtensions
+      --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog
+      --conf spark.sql.catalog.nessie.uri=http://nessie:19120/api/v2
+      --conf spark.sql.catalog.nessie.ref=main
+      --conf spark.sql.catalog.nessie.authentication.type=NONE
+      --conf spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog
+      --conf spark.sql.catalog.nessie.warehouse=s3://fedsentinel-warehouse/
+      --conf spark.sql.catalog.nessie.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+      --conf spark.sql.catalog.nessie.s3.endpoint=http://minio:9000
+      --conf spark.sql.catalog.nessie.s3.path-style-access=true
+      --conf spark.sql.catalog.nessie.s3.access-key-id=minioadmin
+      --conf spark.sql.catalog.nessie.s3.secret-access-key=minioadmin
+      "
+
+networks:
+  fedsentinel_net:
+
+volumes:
+  fedsentinel_minio_data:
