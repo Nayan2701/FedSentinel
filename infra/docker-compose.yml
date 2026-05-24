@@ -209,6 +209,65 @@ services:
       - ./analytics:/analytics:ro
     entrypoint: ["sh", "-lc", "sleep infinity"]
 
+  healer:
+    image: python:3.11-slim
+    container_name: fedsentinel-healer
+    volumes:
+      - fedsentinel_inbox:/data/inbox
+      - ../analytics:/analytics:ro
+    environment:
+      HEAL_INTERVAL_SECONDS: "60"
+      BRONZE_PATH: "/data/inbox/edge_insights.jsonl"
+      SILVER_PATH: "/data/inbox/edge_insights_silver.parquet"
+      BADROWS_PATH: "/data/inbox/edge_insights_bad_rows.jsonl"
+      METRICS_PATH: "/data/inbox/healer_metrics.jsonl"
+    command: >
+      bash -lc "pip -q install pandas pyarrow &&
+                python /analytics/heal_loop.py"
+    restart: unless-stopped
+
+
+  healer-watchdog:
+    image: alpine:3.20
+    container_name: fedsentinel-healer-watchdog
+    volumes:
+      - fedsentinel_inbox:/data/inbox
+    depends_on:
+      - healer
+    restart: unless-stopped
+    command:
+      - sh
+      - -lc
+      - |
+          echo "[watchdog] started"
+
+          SILVER="/data/inbox/edge_insights_silver.parquet"
+          STATUS="/data/inbox/healer_status.json"
+
+          while true; do
+            if [ ! -f "$$SILVER" ]; then
+              echo "[watchdog] FAIL: silver parquet missing: $$SILVER"
+              exit 1
+            fi
+
+            now=$$(date +%s)
+            mtime=$$(stat -c %Y "$$SILVER" 2>/dev/null || echo 0)
+            age=$$(( $$now - $$mtime ))
+
+            if [ "$$mtime" -eq 0 ] || [ "$$age" -gt 120 ]; then
+              echo "[watchdog] FAIL: silver parquet stale (age=$${age}s): $$SILVER"
+              exit 1
+            fi
+
+            if [ -f "$$STATUS" ] && grep -q "\"status\": \"degraded\"" "$$STATUS"; then
+              echo "[watchdog] FAIL: healer status degraded"
+              tail -n 1 "$$STATUS" || true
+              exit 1
+            fi
+
+            sleep 30
+          done
+
 networks:
   fedsentinel_net:
 
