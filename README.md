@@ -2,6 +2,8 @@
 
 FedSentinel is a small, end-to-end data pipeline project that simulates edge security insights, **heals** malformed inputs into a clean **Silver Parquet** dataset, and serves a **Streamlit dashboard** to visualize results.
 
+Dashboard URL: https://fedsentinel.onrender.com
+
 ## What this project demonstrates
 - **Bronze → Silver pipeline**: JSONL inputs (“Bronze”) are validated/normalized into Parquet (“Silver”).
 - **Self-healing behavior**: bad records are quarantined instead of breaking the pipeline.
@@ -103,6 +105,11 @@ Set the following env vars on the Render **Web Service**:
 ---
 
 ## Screenshots / Demo media (recommended)
-Add screenshots/GIFs under `assets/`:
+
 - dashboard overview
+  <img width="1407" height="835" alt="image" src="https://github.com/user-attachments/assets/a1fd4a68-dcec-465b-882e-01bc2b006803" />
+  <img width="1377" height="782" alt="image" src="https://github.com/user-attachments/assets/736662e3-7241-4077-8a52-13c45a21355b" />
+
+
 - self-healing proof panel showing status + quarantined count changing after injecting a bad record
+  <img width="615" height="816" alt="Screenshot 2026-05-24 at 2 17 39 PM" src="https://github.com/user-attachments/assets/54024584-9128-4845-8c6f-f78dea286177" />
