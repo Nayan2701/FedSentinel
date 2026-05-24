@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /srv
+
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir pandas pyarrow
+
+COPY analytics/ /srv/analytics/
+
+ENV PYTHONUNBUFFERED=1
+ENV HEAL_INTERVAL_SECONDS=60
+ENV BRONZE_PATH=/data/inbox/edge_insights.jsonl
+ENV SILVER_PATH=/data/inbox/edge_insights_silver.parquet
+ENV BADROWS_PATH=/data/inbox/edge_insights_bad_rows.jsonl
+ENV METRICS_PATH=/data/inbox/healer_metrics.jsonl
+ENV STATUS_PATH=/data/inbox/healer_status.json
+
+CMD ["python", "/srv/analytics/heal_loop.py"]

@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps (pyarrow wheels usually work without build tools; keep it minimal)
+RUN pip install --no-cache-dir --upgrade pip
+
+COPY app/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY app/ /app/
+
+EXPOSE 8501
+
+ENV PYTHONUNBUFFERED=1
+CMD ["streamlit", "run", "/app/streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]

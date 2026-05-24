@@ -3,6 +3,7 @@ import time
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+from seed_bronze import seed_if_missing_or_empty
 
 import pandas as pd
 
@@ -23,6 +24,8 @@ def heal_once() -> dict:
 
     total = 0
     bad = 0
+    seed_if_missing_or_empty(BRONZE_PATH, Path(__file__).with_name("sample_bronze.jsonl"))
+
 
     if not BRONZE_PATH.exists():
         metrics = {"run_ts": utc_now(), "status": "bronze_missing", "bronze_path": str(BRONZE_PATH)}
