@@ -5,14 +5,19 @@ services:
     dockerfilePath: ./Dockerfile.dashboard
     plan: free
     autoDeploy: true
-    healthCheckPath: /
     envVars:
-      - key: INBOX_PATH
-        value: /data/inbox
-    disk:
-      name: fedsentinel-inbox
-      mountPath: /data/inbox
-      sizeGB: 1
+      - key: SILVER_S3_BUCKET
+        sync: false
+      - key: SILVER_S3_KEY
+        value: silver/edge_insights_silver.parquet
+      - key: STATUS_S3_KEY
+        value: status/healer_status.json
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
 
   - type: worker
     name: fedsentinel-healer
@@ -23,7 +28,17 @@ services:
     envVars:
       - key: HEAL_INTERVAL_SECONDS
         value: "60"
-    disk:
-      name: fedsentinel-inbox
-      mountPath: /data/inbox
-      sizeGB: 1
+      - key: SILVER_S3_BUCKET
+        sync: false
+      - key: SILVER_S3_KEY
+        value: silver/edge_insights_silver.parquet
+      - key: SILVER_S3_PREV_KEY
+        value: silver/edge_insights_silver.parquet.prev
+      - key: STATUS_S3_KEY
+        value: status/healer_status.json
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
