@@ -198,10 +198,23 @@ services:
       INTERVAL_SEC: "45"
     networks: [fedsentinel_net]
 
+  duckdb:
+    image: quay.io/duckdb/duckdb:latest
+    container_name: fedsentinel-duckdb
+    depends_on:
+      - central-ingestor
+    volumes:
+      # must mount the same data folder where edge_insights.jsonl lives
+      - fedsentinel_inbox:/data/inbox
+      - ./analytics:/analytics:ro
+    entrypoint: ["sh", "-lc", "sleep infinity"]
+
 networks:
   fedsentinel_net:
 
 volumes:
   fedsentinel_minio_data:
   fedsentinel_inbox:
+     name: infra_fedsentinel_inbox
+     external: true
   ollama_data:
