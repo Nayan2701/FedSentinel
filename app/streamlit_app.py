@@ -1,24 +1,60 @@
 import json
+import os
 import time
 from pathlib import Path
 from datetime import datetime, timezone
-import os
+
+import boto3
 import duckdb
 import pandas as pd
 import streamlit as st
 
-INBOX = Path(os.getenv("INBOX_PATH","/data/inbox"))
-SILVER = INBOX / "edge_insights_silver.parquet"
-STATUS = INBOX / "healer_status.json"
-METRICS = INBOX / "healer_metrics.jsonl"
-BADROWS = INBOX / "edge_insights_bad_rows.jsonl"
+
+# -----------------------
+# R2/S3 config (required)
+# -----------------------
+S3_ENDPOINT_URL = os.environ["S3_ENDPOINT_URL"]
+S3_ACCESS_KEY_ID = os.environ["S3_ACCESS_KEY_ID"]
+S3_SECRET_ACCESS_KEY = os.environ["S3_SECRET_ACCESS_KEY"]
+
+S3_BUCKET = os.environ["SILVER_S3_BUCKET"]
+SILVER_KEY = os.getenv("SILVER_S3_KEY", "silver/edge_insights_silver.parquet")
+STATUS_KEY = os.getenv("STATUS_S3_KEY", "status/healer_status.json")
+
+BADROWS_KEY = os.getenv("BADROWS_S3_KEY", "quarantine/edge_insights_bad_rows.jsonl")  # optional
+
+TMP_DIR = Path("/tmp/fedsentinel-dashboard")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_SILVER = TMP_DIR / "edge_insights_silver.parquet"
+LOCAL_STATUS = TMP_DIR / "healer_status.json"
 
 
-def read_json(path: Path):
+def s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT_URL,
+        aws_access_key_id=S3_ACCESS_KEY_ID,
+        aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+    )
+
+
+def download_key_to_file(key: str, local_path: Path) -> bool:
+    s3 = s3_client()
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(S3_BUCKET, key, str(local_path))
+        return True
     except Exception:
-        return None
+        return False
+
+
+def head_key(key: str):
+    s3 = s3_client()
+    return s3.head_object(Bucket=S3_BUCKET, Key=key)
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def file_mtime_utc(path: Path):
@@ -29,47 +65,54 @@ def file_mtime_utc(path: Path):
         return None
 
 
-def tail_jsonl(path: Path, n: int = 10):
-    """Read last n JSON objects from a JSONL file (best-effort, small files expected)."""
-    if not path.exists():
-        return []
+def read_json(path: Path):
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        out = []
-        for s in lines[-n:]:
-            s = s.strip()
-            if not s:
-                continue
-            try:
-                out.append(json.loads(s))
-            except Exception:
-                out.append({"raw": s})
-        return out
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return []
-
-
-def count_lines(path: Path, max_bytes: int = 20_000_000):
-    """Count lines without blowing up memory; caps reads for safety."""
-    if not path.exists():
-        return 0
-    try:
-        # If file is huge, do a streaming count anyway (still OK for most demos).
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            return sum(1 for _ in f)
-    except Exception:
-        return 0
+        return None
 
 
 @st.cache_data(ttl=10)
-def load_tables(silver_path: str):
+def fetch_remote_files():
+    """
+    Downloads Silver + Status from R2 to /tmp.
+    Uses ETag check to avoid redundant downloads when unchanged.
+    """
+    # Silver
+    silver_head = head_key(SILVER_KEY)
+    silver_etag = silver_head.get("ETag", "").strip('"')
+    silver_last_modified = silver_head.get("LastModified")
+
+    etag_path = TMP_DIR / ".silver_etag"
+    prev = etag_path.read_text().strip() if etag_path.exists() else ""
+
+    if (not LOCAL_SILVER.exists()) or (prev != silver_etag):
+        ok = download_key_to_file(SILVER_KEY, LOCAL_SILVER)
+        if ok:
+            etag_path.write_text(silver_etag)
+
+    # Status (best-effort; doesn't have to exist)
+    try:
+        _ = head_key(STATUS_KEY)
+        download_key_to_file(STATUS_KEY, LOCAL_STATUS)
+    except Exception:
+        pass
+
+    return {
+        "silver_etag": silver_etag,
+        "silver_last_modified": silver_last_modified.isoformat() if silver_last_modified else None,
+        "local_silver_path": str(LOCAL_SILVER),
+        "local_status_path": str(LOCAL_STATUS),
+        "fetched_at": utc_now_iso(),
+    }
+
+
+@st.cache_data(ttl=10)
+def load_tables(local_silver_path: str):
     con = duckdb.connect(database=":memory:")
     con.execute("INSTALL parquet; LOAD parquet;")
 
-    df = con.execute(
-        "SELECT * FROM read_parquet(?)",
-        [silver_path],
-    ).fetchdf()
+    df = con.execute("SELECT * FROM read_parquet(?)", [local_silver_path]).fetchdf()
 
     by_region = con.execute(
         """
@@ -80,7 +123,7 @@ def load_tables(silver_path: str):
         GROUP BY 1
         ORDER BY insights DESC
         """,
-        [silver_path],
+        [local_silver_path],
     ).fetchdf()
 
     risk_dist = con.execute(
@@ -90,7 +133,7 @@ def load_tables(silver_path: str):
         GROUP BY 1
         ORDER BY insights DESC
         """,
-        [silver_path],
+        [local_silver_path],
     ).fetchdf()
 
     llm_vs_fallback = con.execute(
@@ -100,7 +143,7 @@ def load_tables(silver_path: str):
         GROUP BY 1
         ORDER BY insights DESC
         """,
-        [silver_path],
+        [local_silver_path],
     ).fetchdf()
 
     top_actions = con.execute(
@@ -116,21 +159,20 @@ def load_tables(silver_path: str):
         ORDER BY occurrences DESC
         LIMIT 50
         """,
-        [silver_path],
+        [local_silver_path],
     ).fetchdf()
 
     return df, by_region, risk_dist, llm_vs_fallback, top_actions
 
 
 st.set_page_config(page_title="FedSentinel Dashboard", layout="wide")
-st.title("FedSentinel — Edge Security Insights Dashboard")
+st.title("FedSentinel — Edge Security Insights Dashboard (R2-backed)")
 
 # -----------------------
-# Controls (auto-refresh)
+# Controls
 # -----------------------
 with st.sidebar:
     st.header("Controls")
-
     c1, c2 = st.columns(2)
     with c1:
         auto_refresh = st.toggle("Auto-refresh", value=True)
@@ -141,62 +183,62 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# Auto-refresh mechanism (simple + reliable)
+# Auto-refresh
 if auto_refresh:
     time.sleep(int(refresh_seconds))
     st.cache_data.clear()
     st.rerun()
 
 # -----------------------
+# Fetch remote (R2)
+# -----------------------
+meta = fetch_remote_files()
+
+if not Path(meta["local_silver_path"]).exists():
+    st.error(
+        f"Silver Parquet not available yet. Waiting for healer to publish to R2: s3://{S3_BUCKET}/{SILVER_KEY}"
+    )
+    st.stop()
+
+status = read_json(Path(meta["local_status_path"])) or {}
+
+# -----------------------
 # Self-healing proof
 # -----------------------
-st.subheader("Self-healing proof (health, rollback, quarantine)")
-
-status = read_json(STATUS) or {}
-silver_mtime = file_mtime_utc(SILVER)
-bad_count = count_lines(BADROWS) if BADROWS.exists() else 0
-recent_metrics = tail_jsonl(METRICS, n=8)
+st.subheader("Self-healing proof (R2 persistence, rollback-ready, quarantine)")
 
 p1, p2, p3, p4 = st.columns(4)
 with p1:
     st.metric("Healer status", status.get("status", "unknown"))
 with p2:
-    st.metric("Bad rows quarantined", bad_count)
-with p3:
     st.metric("Rows written (last run)", status.get("rows_written", "n/a"))
-with p4:
+with p3:
     st.metric("Bad skipped (last run)", status.get("bad_rows_skipped", "n/a"))
+with p4:
+    st.metric("Silver ETag", (meta.get("silver_etag") or "")[:12] + "…")
 
-if silver_mtime:
-    st.caption(f"Silver Parquet last modified (UTC): {silver_mtime.isoformat()}")
-else:
-    st.error("Silver Parquet not found. Start the healer: `docker compose up -d healer healer-watchdog`")
-    st.stop()
+st.caption(
+    f"Remote silver: s3://{S3_BUCKET}/{SILVER_KEY} | "
+    f"LastModified: {meta.get('silver_last_modified')} | "
+    f"Fetched: {meta.get('fetched_at')} | "
+    f"Local mtime: {file_mtime_utc(Path(meta['local_silver_path'])).isoformat()}"
+)
 
-with st.expander("Show healer_status.json (last run)"):
+with st.expander("Show healer_status.json (from R2)"):
     if status:
-        st.json({k: status.get(k) for k in ["run_ts", "status", "reason", "total_lines_seen", "rows_written", "bad_rows_skipped"]})
+        st.json(status)
     else:
-        st.write("(missing)")
-
-with st.expander("Show last 8 healer_metrics.jsonl entries"):
-    if recent_metrics:
-        st.dataframe(pd.DataFrame(recent_metrics), use_container_width=True)
-    else:
-        st.write("(no metrics yet)")
-
-st.divider()
+        st.write("(status not found yet)")
 
 # -----------------------
-# Main analytics
+# Analytics
 # -----------------------
 try:
-    df, by_region, risk_dist, llm_vs_fallback, top_actions = load_tables(str(SILVER))
+    df, by_region, risk_dist, llm_vs_fallback, top_actions = load_tables(meta["local_silver_path"])
 except Exception as e:
-    st.error(f"Failed to read Silver Parquet with DuckDB: {e}")
+    st.error(f"Failed to query silver parquet with DuckDB: {e}")
     st.stop()
 
-# KPIs
 k1, k2, k3, k4 = st.columns(4)
 with k1:
     st.metric("Total insights", int(len(df)))
@@ -213,10 +255,7 @@ with k4:
 left, right = st.columns(2)
 with left:
     st.subheader("Insights by region")
-    if not by_region.empty:
-        st.bar_chart(by_region.set_index("region")["insights"])
-    else:
-        st.write("(no data)")
+    st.bar_chart(by_region.set_index("region")["insights"] if not by_region.empty else pd.Series(dtype=int))
 
 with right:
     st.subheader("Risk distribution")

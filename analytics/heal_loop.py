@@ -1,160 +1,242 @@
+import json
 import os
 import time
-import json
-from pathlib import Path
 from datetime import datetime, timezone
-from seed_bronze import seed_if_missing_or_empty
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-INTERVAL = int(os.getenv("HEAL_INTERVAL_SECONDS", "60"))
+from r2_io import download_file, upload_file, object_exists
 
-BRONZE_PATH = Path(os.getenv("BRONZE_PATH", "/data/inbox/edge_insights.jsonl"))
-SILVER_PATH = Path(os.getenv("SILVER_PATH", "/data/inbox/edge_insights_silver.parquet"))
-BADROWS_PATH = Path(os.getenv("BADROWS_PATH", "/data/inbox/edge_insights_bad_rows.jsonl"))
-METRICS_PATH = Path(os.getenv("METRICS_PATH", "/data/inbox/healer_metrics.jsonl"))
-STATUS_PATH = Path(os.getenv("STATUS_PATH", "/data/inbox/healer_status.json"))
+# -----------------------
+# Paths (local temp only)
+# -----------------------
+TMP_DIR = Path("/tmp/fedsentinel")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+LOCAL_BRONZE = TMP_DIR / "edge_insights.jsonl"
+LOCAL_SILVER_TMP = TMP_DIR / "edge_insights_silver.parquet.tmp"
+LOCAL_SILVER = TMP_DIR / "edge_insights_silver.parquet"
+LOCAL_BADROWS = TMP_DIR / "edge_insights_bad_rows.jsonl"
+LOCAL_STATUS = TMP_DIR / "healer_status.json"
 
-def heal_once() -> dict:
-    rows = []
-    bad_rows = []
+# -----------------------
+# Required S3/R2 env vars
+# -----------------------
+S3_BUCKET = os.environ["SILVER_S3_BUCKET"]
 
-    total = 0
-    bad = 0
-    seed_if_missing_or_empty(BRONZE_PATH, Path(__file__).with_name("sample_bronze.jsonl"))
+BRONZE_KEY = os.getenv("BRONZE_S3_KEY", "bronze/edge_insights.jsonl")
+
+SILVER_KEY = os.getenv("SILVER_S3_KEY", "silver/edge_insights_silver.parquet")
+SILVER_PREV_KEY = os.getenv("SILVER_S3_PREV_KEY", "silver/edge_insights_silver.parquet.prev")
+
+STATUS_KEY = os.getenv("STATUS_S3_KEY", "status/healer_status.json")
+BADROWS_KEY = os.getenv("BADROWS_S3_KEY", "quarantine/edge_insights_bad_rows.jsonl")
+
+HEAL_INTERVAL_SECONDS = int(os.getenv("HEAL_INTERVAL_SECONDS", "60"))
+
+# -----------------------
+# Helpers
+# -----------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-    if not BRONZE_PATH.exists():
-        metrics = {"run_ts": utc_now(), "status": "bronze_missing", "bronze_path": str(BRONZE_PATH)}
-        _append_metrics(metrics)
-        return metrics
+def safe_json_loads(s: str):
+    return json.loads(s)
 
-    with BRONZE_PATH.open("r", encoding="utf-8", errors="replace") as fin:
-        for line in fin:
-            total += 1
-            s = line.strip()
-            if not s:
+
+def parse_bronze_line(line: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Returns (record, payload_obj). payload_obj is parsed from record["payload"] which is JSON string.
+    """
+    rec = safe_json_loads(line)
+    payload_raw = rec.get("payload", "{}")
+    if isinstance(payload_raw, dict):
+        payload_obj = payload_raw
+    else:
+        payload_obj = safe_json_loads(payload_raw)
+    return rec, payload_obj
+
+
+def normalize_row(rec: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep the columns your analytics expects (adjust if your schema differs)
+    quality_meta = rec.get("quality_meta") or {}
+    top_actions = payload.get("top_actions") or []
+
+    return {
+        "node_id": rec.get("node_id"),
+        "region": rec.get("region"),
+        "model": rec.get("model"),
+        "quality_score": rec.get("quality_score"),
+        "event_ts": rec.get("event_ts"),
+        "ingest_ts": rec.get("ingest_ts"),
+        "summary_source": quality_meta.get("summary_source") or rec.get("summary_source") or payload.get("summary_source"),
+        "pii_leak_risk": payload.get("pii_leak_risk"),
+        "summary": payload.get("summary"),
+        "top_actions": top_actions,
+        # Optional nested meta as JSON string (keeps parquet simple)
+        "payload_meta_json": json.dumps(payload.get("meta", {}), ensure_ascii=False),
+    }
+
+
+def write_parquet_atomic(df: pd.DataFrame, out_tmp: Path, out_final: Path):
+    # Ensure list column has correct dtype
+    if "top_actions" in df.columns:
+        df["top_actions"] = df["top_actions"].apply(lambda x: x if isinstance(x, list) else ([] if x is None else [str(x)]))
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(table, out_tmp)
+
+    # Validate readable
+    _ = pq.read_table(out_tmp, columns=["node_id"]).to_pandas()
+
+    # Promote
+    out_final.write_bytes(out_tmp.read_bytes())
+
+
+def download_bronze_from_r2() -> bool:
+    return download_file(S3_BUCKET, BRONZE_KEY, LOCAL_BRONZE)
+
+
+def append_badrows(bad_rows: List[Dict[str, Any]]):
+    if not bad_rows:
+        return
+    with LOCAL_BADROWS.open("a", encoding="utf-8") as f:
+        for row in bad_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def upload_status(status: Dict[str, Any]):
+    LOCAL_STATUS.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+    upload_file(LOCAL_STATUS, S3_BUCKET, STATUS_KEY)
+
+
+def upload_badrows_if_any():
+    if LOCAL_BADROWS.exists() and LOCAL_BADROWS.stat().st_size > 0:
+        upload_file(LOCAL_BADROWS, S3_BUCKET, BADROWS_KEY)
+
+
+def rotate_prev_and_upload_new_silver():
+    # If current silver exists remotely, copy it to prev by downloading then uploading
+    if object_exists(S3_BUCKET, SILVER_KEY):
+        if download_file(S3_BUCKET, SILVER_KEY, TMP_DIR / "remote_current.parquet"):
+            upload_file(TMP_DIR / "remote_current.parquet", S3_BUCKET, SILVER_PREV_KEY)
+
+    # Upload new silver
+    upload_file(LOCAL_SILVER, S3_BUCKET, SILVER_KEY)
+
+
+def heal_once() -> Dict[str, Any]:
+    run_ts = utc_now_iso()
+
+    # Ensure local temp files are clean for this run
+    for p in [LOCAL_BRONZE, LOCAL_SILVER_TMP, LOCAL_SILVER]:
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    bronze_ok = download_bronze_from_r2()
+    if not bronze_ok or (not LOCAL_BRONZE.exists()) or LOCAL_BRONZE.stat().st_size == 0:
+        status = {
+            "run_ts": run_ts,
+            "status": "bronze_missing",
+            "reason": f"Could not download or bronze empty: s3://{S3_BUCKET}/{BRONZE_KEY}",
+            "bronze_bucket": S3_BUCKET,
+            "bronze_key": BRONZE_KEY,
+        }
+        upload_status(status)
+        return status
+
+    total_lines = 0
+    rows: List[Dict[str, Any]] = []
+    bad: List[Dict[str, Any]] = []
+
+    with LOCAL_BRONZE.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
+            total_lines += 1
             try:
-                obj = json.loads(s)
-
-                payload_raw = obj.get("payload")
-                if not isinstance(payload_raw, str):
-                    raise ValueError("payload not a string")
-
-                payload = json.loads(payload_raw)
-                if not isinstance(payload, dict):
-                    raise ValueError("payload not an object")
-
-                meta = payload.get("meta") or {}
-                quality_meta = obj.get("quality_meta") or {}
-
-                rows.append(
+                rec, payload = parse_bronze_line(line)
+                rows.append(normalize_row(rec, payload))
+            except Exception as e:
+                bad.append(
                     {
-                        "node_id": obj.get("node_id"),
-                        "region": obj.get("region"),
-                        "model": obj.get("model"),
-                        "quality_score": obj.get("quality_score"),
-                        "event_ts": obj.get("event_ts"),
-                        "ingest_ts": obj.get("ingest_ts"),
-                        "summary_source": quality_meta.get("summary_source"),
-                        "pii_leak_risk": payload.get("pii_leak_risk"),
-                        "summary": payload.get("summary"),
-                        "top_actions": payload.get("top_actions"),
-                        "events": meta.get("events"),
-                        "avg_latency_ms": meta.get("avg_latency_ms"),
-                        "top_ip_class": meta.get("top_ip_class"),
+                        "run_ts": run_ts,
+                        "error": str(e),
+                        "raw": line[:5000],
                     }
                 )
-            except Exception as e:
-                bad += 1
-                bad_rows.append({"ts": utc_now(), "error": str(e), "raw": s[:5000]})
+
+    append_badrows(bad)
+
+    if not rows:
+        status = {
+            "run_ts": run_ts,
+            "status": "degraded",
+            "reason": "No valid rows parsed from bronze",
+            "total_lines_seen": total_lines,
+            "rows_written": 0,
+            "bad_rows_skipped": len(bad),
+            "bronze_bucket": S3_BUCKET,
+            "bronze_key": BRONZE_KEY,
+        }
+        upload_status(status)
+        upload_badrows_if_any()
+        return status
 
     df = pd.DataFrame(rows)
 
-    # Atomic + rollback-capable publish
-    tmp = SILVER_PATH.with_suffix(SILVER_PATH.suffix + ".tmp")
-    prev = SILVER_PATH.with_suffix(SILVER_PATH.suffix + ".prev")
-    SILVER_PATH.parent.mkdir(parents=True, exist_ok=True)
-
     try:
-        # 1) write tmp
-        df.to_parquet(tmp, index=False)
+        write_parquet_atomic(df, LOCAL_SILVER_TMP, LOCAL_SILVER)
+        rotate_prev_and_upload_new_silver()
 
-        # 2) validate tmp is readable and (if bronze had lines) non-empty
-        check = pd.read_parquet(tmp)
-        if total > 0 and len(check) == 0:
-            raise ValueError("validation failed: empty parquet after non-empty bronze")
+        status = {
+            "run_ts": run_ts,
+            "status": "ok",
+            "reason": "published_to_r2",
+            "total_lines_seen": total_lines,
+            "rows_written": int(len(df)),
+            "bad_rows_skipped": int(len(bad)),
+            "silver_bucket": S3_BUCKET,
+            "silver_key": SILVER_KEY,
+            "silver_prev_key": SILVER_PREV_KEY,
+            "badrows_key": BADROWS_KEY,
+        }
+        upload_status(status)
+        upload_badrows_if_any()
+        return status
 
-        # 3) rotate last-known-good
-        if SILVER_PATH.exists():
-            try:
-                SILVER_PATH.replace(prev)
-            except Exception:
-                # best-effort rotate; don't block publish
-                pass
-
-        # 4) promote tmp -> silver
-        tmp.replace(SILVER_PATH)
-
-        status = "ok"
-        reason = ""
     except Exception as e:
-        # Leave last known good in place; cleanup tmp
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-        status = "degraded"
-        reason = f"publish_failed: {e}"
+        status = {
+            "run_ts": run_ts,
+            "status": "degraded",
+            "reason": f"publish_failed: {e}",
+            "total_lines_seen": total_lines,
+            "rows_written": int(len(df)),
+            "bad_rows_skipped": int(len(bad)),
+            "silver_bucket": S3_BUCKET,
+            "silver_key": SILVER_KEY,
+        }
+        upload_status(status)
+        upload_badrows_if_any()
+        return status
 
-    # quarantine bad rows (best-effort)
-    if bad_rows:
-        try:
-            with BADROWS_PATH.open("a", encoding="utf-8") as f:
-                for r in bad_rows:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-
-    metrics = {
-        "run_ts": utc_now(),
-        "status": status,
-        "reason": reason,
-        "bronze_path": str(BRONZE_PATH),
-        "silver_path": str(SILVER_PATH),
-        "total_lines_seen": total,
-        "rows_written": int(len(df)),
-        "bad_rows_skipped": bad,
-    }
-    try:
-        STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATUS_PATH.write_text(json.dumps(metrics), encoding="utf-8")
-    except Exception:
-        pass
-    _append_metrics(metrics)
-    return metrics
-
-def _append_metrics(metrics: dict) -> None:
-    METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with METRICS_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(metrics) + "\n")
 
 def main():
-    print(
-        f"[healer] starting; interval={INTERVAL}s bronze={BRONZE_PATH} silver={SILVER_PATH}",
-        flush=True,
-    )
+    print(f"[healer] started (R2 mode) interval={HEAL_INTERVAL_SECONDS}s bronze=s3://{S3_BUCKET}/{BRONZE_KEY} silver=s3://{S3_BUCKET}/{SILVER_KEY}", flush=True)
     while True:
-        try:
-            m = heal_once()
-            print(f"[healer] {m}", flush=True)
-        except Exception as e:
-            print(f"[healer] ERROR: {e}", flush=True)
-        time.sleep(INTERVAL)
+        status = heal_once()
+        print(f"[healer] {status.get('status')} run_ts={status.get('run_ts')} rows_written={status.get('rows_written')} bad_rows_skipped={status.get('bad_rows_skipped')} reason={status.get('reason')}", flush=True)
+        time.sleep(HEAL_INTERVAL_SECONDS)
+
 
 if __name__ == "__main__":
     main()

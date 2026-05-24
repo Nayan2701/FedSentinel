@@ -4,7 +4,7 @@ WORKDIR /srv
 
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir pandas pyarrow
-
+RUN pip install --no-cache-dir pandas pyarrow boto3
 COPY analytics/ /srv/analytics/
 
 ENV PYTHONUNBUFFERED=1
